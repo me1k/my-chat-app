@@ -1,0 +1,32 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id       String   @id
+  friends  Friend[] @relation("UserFriends") // Opposite relation field added
+  name     String
+  password String
+}
+
+model Friend {
+  id        Int     @id @default(autoincrement())
+  name      String
+  user      User?   @relation("UserFriends", fields: [userId], references: [id]) // Opposite relation field added
+  userId    String?
+  friendId  String  @unique // Ensure friendId is unique
+}
+
+model Message {
+  id        Int     @id @default(autoincrement())
+  content   String?
+  published Boolean @default(false)
+}
