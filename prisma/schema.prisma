@@ -11,22 +11,28 @@ datasource db {
 }
 
 model User {
-  id       String   @id
-  friends  Friend[] @relation("UserFriends") // Opposite relation field added
+  id       String    @id @default(cuid())
+  friends  Friend[]  @relation("UserFriends") // Opposite relation field added
   name     String
   password String
+  messages Message[] @relation("UserMessages")
 }
 
 model Friend {
-  id        Int     @id @default(autoincrement())
-  name      String
-  user      User?   @relation("UserFriends", fields: [userId], references: [id]) // Opposite relation field added
-  userId    String?
-  friendId  String  @unique // Ensure friendId is unique
+  id       String    @id @default(cuid())
+  name     String
+  user     User?     @relation("UserFriends", fields: [userId], references: [id])
+  userId   String
+  friendId String    
+  messages Message[] @relation("FriendMessages")
 }
 
 model Message {
-  id        Int     @id @default(autoincrement())
+  id        String  @id @default(cuid())
   content   String?
   published Boolean @default(false)
+  user      User    @relation("UserMessages", fields: [userId], references: [id]) // Relation to the user who sent the message
+  userId    String // References the id field in the User model, which is String
+  friend    Friend  @relation("FriendMessages", fields: [friendId], references: [id]) // Relation to the friend who received the message
+  friendId  String // References the friendId field in the Friend model, which is String
 }

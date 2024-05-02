@@ -7,22 +7,18 @@ import * as bcrypt from 'bcrypt';
 import session from 'express-session';
 import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
-import { v4 as uuidv4 } from 'uuid';
+import cookieParser from 'cookie-parser';
 
 const secret = dotenv.config().parsed?.APP_SECRET;
 const tokenSecret = dotenv.config().parsed?.TOKEN_SECRET;
+const refreshTokenSecret = dotenv.config().parsed?.REFRESH_TOKEN_SECRET;
 const prisma = new PrismaClient();
 const app = express();
-app.use(cors());
+app.use(cors({ origin: 'http://localhost:3000', credentials: true }));
 app.use(express.json());
-app.use(
-  session({
-    secret: secret || '',
-    cookie: { maxAge: 1000 * 60 * 60 * 24 },
-    resave: true,
-    saveUninitialized: true,
-  })
-);
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
+app.use(cookieParser());
 
 const server = createServer(app);
 const io = new Server(server, { cors: { origin: 'http://localhost:3000' } });
@@ -41,13 +37,56 @@ io.on('connection', (socket) => {
     sender.set(socket.id, userId);
   });
 
-  socket.on('message', (data) => {
-    console.log({ data, socketId: socket.id, senderId: sender.get(socket.id) });
+  socket.on('message', async (data) => {
+    const senderId = sender.get(socket.id);
+    const receiverId = data.to;
+
+    console.log('Sender ID:', senderId);
+    console.log('Receiver ID:', receiverId);
+
+    // try {
+    //   // Check if sender and receiver are friends
+    //   const existingFriendship = await prisma.friend.findFirst({
+    //     where: {
+    //       userId: senderId,
+    //       friendId: receiverId,
+    //     },
+    //   });
+
+    //   // If sender and receiver are not friends, handle the error or return
+    //   if (!existingFriendship) {
+    //     console.error('Sender and receiver are not friends.');
+    //     // Handle the error or return early
+    //     return;
+    //   }
+
+    //   await prisma.message.create({
+    //     data: {
+    //       content: data.message,
+    //       published: true,
+    //       user: { connect: { id: senderId } },
+    //       friend: { connect: { id: receiverId } },
+    //     },
+    //   });
+
+    //   // Emit the new message to the receiver
+    //   io.to(users.get(data.to)).emit('new_msg', {
+    //     from: {
+    //       senderSocketId: socket.id,
+    //       senderId,
+    //       room: receiverId,
+    //     },
+    //     message: data.message,
+    //   });
+    // } catch (error) {
+    //   console.error('Error creating message:', error);
+    //   // Handle the error
+    // }
     io.to(users.get(data.to)).emit('new_msg', {
       from: {
         senderSocketId: socket.id,
-        senderId: sender.get(socket.id),
-        room: data.to,
+        senderId,
+        room: receiverId,
       },
       message: data.message,
     });
@@ -84,7 +123,6 @@ app.post('/register', async (req, res) => {
         data: {
           name: username,
           password: hash,
-          id: uuidv4(),
         },
       });
       res.status(200).json({ ok: true });
@@ -92,36 +130,101 @@ app.post('/register', async (req, res) => {
   }
 });
 
-app.get('/logout', (req, res) => {
-  req.session.destroy(() => res.status(200).json({ ok: true }));
+app.post('/logout', (req, res) => {
+  // Clear the refresh token cookie
+  res.clearCookie('refreshToken', {
+    httpOnly: true,
+    secure: false,
+    domain: 'localhost',
+    path: '/',
+  });
+
+  // Respond with success message
+  res.status(200).json({ ok: true });
 });
 
 app.post('/login', async (req, res) => {
   const { username, password } = req.body;
-  let token = '';
-  (req.session as any).username = username;
 
-  const user = await prisma.user.findFirst({ where: { name: username } });
+  try {
+    // Find user in the database
+    const user = await prisma.user.findFirst({ where: { name: username } });
 
-  if (user) {
-    const isMatch = await bcrypt.compare(password, user.password);
-    console.log({ isMatch });
-    if (isMatch) {
-      token = jwt.sign({ id: user.id }, tokenSecret || '', {
-        expiresIn: '24h',
-      });
+    if (user) {
+      // Compare passwords
+      const isMatch = await bcrypt.compare(password, user.password);
 
-      res.status(200).json({
-        ok: true,
-        user,
-        session: { sessionID: req.sessionID, session: req.session },
-        token: token,
-      });
+      if (isMatch) {
+        // Generate access token
+        const accessToken = jwt.sign({ id: user.id }, tokenSecret || '', {
+          expiresIn: '1h',
+        });
+
+        // Generate refresh token
+        const refreshToken = jwt.sign(
+          { id: user.id },
+          refreshTokenSecret || '',
+          {
+            expiresIn: '2h',
+          }
+        );
+
+        // Set refresh token as an HTTP-only cookie
+        res.cookie('refreshToken', refreshToken, {
+          httpOnly: true,
+          secure: false,
+        });
+
+        console.log('/login', { accessToken, refreshToken });
+        // Send response with access token and other data
+        res.status(200).json({
+          ok: true,
+          user,
+          accessToken,
+          refreshToken,
+        });
+      } else {
+        // Password mismatch
+        res.status(401).json({ ok: false, message: 'Invalid password' });
+      }
     } else {
-      res.status(401).json({ ok: false, message: 'Invalid password' });
+      // User not found
+      res.status(401).json({ ok: false, message: 'User not found' });
     }
-  } else {
-    res.status(401).json({ ok: false, message: 'User not found' });
+  } catch (error) {
+    // Internal server error
+    console.error('Error during login:', error);
+    res.status(500).json({ ok: false, message: 'Internal server error' });
+  }
+});
+
+app.post('/refreshToken', async (req, res) => {
+  const refreshToken = req.cookies?.refreshToken;
+
+  if (!refreshToken) {
+    return res.status(401).json({
+      ok: false,
+      message: 'Error! Refresh token was not provided.',
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, refreshTokenSecret || '');
+    const user = await prisma.user.findUnique({
+      where: { id: (decoded as any).id },
+    });
+    if (user) {
+      const accessToken = jwt.sign({ id: user.id }, tokenSecret || '', {
+        expiresIn: '1h',
+      });
+      console.log({ accessToken });
+      return res.status(200).json({ ok: true, accessToken });
+    }
+    return res.status(401).json({ ok: false, message: 'User not found' });
+  } catch (error) {
+    return res
+      .status(401)
+      .json({ ok: false, message: 'Refresh token expired' });
   }
 });
 
@@ -134,41 +237,48 @@ app.get('/user', async (req, res) => {
       message: 'Error!Token was not provided.',
     });
   }
+  try {
+    const decoded = jwt.verify(token.split(' ')[1], tokenSecret || '');
+    const user = await prisma.user.findUnique({
+      where: { id: (decoded as any).id },
+    });
+    if (user) {
+      return res.status(200).json({ ok: true, user });
+    }
+    return res.status(401).json({ ok: false, message: 'User not found' });
+  } catch (error) {
+    return res.status(401).json({ ok: false, message: 'Token expired' });
+  }
 
-  const decodedToken =
-    token && jwt.verify(token.split(' ')[1], tokenSecret || '');
+  // const decodedToken =
+  //   token &&
+  //   jwt.verify(token.split(' ')[1], tokenSecret || '', (err, decoded) => {
+  //     if (err) {
+  //       return res.status(401).json({ ok: false, message: 'Token expired' });
+  //     }
+  //     return decoded;
+  //   });
 
-  const user = await prisma.user.findFirst({
-    where: {
-      id: (decodedToken as any).id,
-    },
-  });
+  // const user = await prisma.user.findFirst({
+  //   where: {
+  //     id: (decodedToken as any).id,
+  //   },
+  // });
 
-  const friends = await prisma.friend.findMany({
-    where: {
-      userId: (decodedToken as any).id,
-    },
-  });
+  // const friends = await prisma.friend.findMany({
+  //   where: {
+  //     userId: (decodedToken as any).id,
+  //   },
+  // });
 
-  if (user && friends)
-    res.status(200).json({ ok: true, user: { ...user, friends } });
-  else return res.status(401).json({ ok: false, message: 'User not found' });
-});
-
-app.post('/user', async (req, res) => {
-  const { id } = req.body;
-  console.log({ req: req.body });
-  const user = await prisma.user.findUnique({ where: { id } });
-
-  res.status(200).json({ ok: true, user });
+  // if (user && friends)
+  //   res.status(200).json({ ok: true, user: { ...user, friends } });
+  // else return res.status(401).json({ ok: false, message: 'User not found' });
 });
 
 app.post('/findUser', async (req, res) => {
   const { name } = req.body;
   const token = req.headers.authorization;
-
-  const decodedToken =
-    token && jwt.verify(token.split(' ')[1], tokenSecret || '');
 
   const user = await prisma.user.findFirst({ where: { name } });
   console.log({ user });
@@ -188,17 +298,31 @@ app.post('/addFriend', async (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-app.get('/friends/:userId', async (req, res) => {
-  const userId = req.params.userId;
+app.get('/friends', async (req, res) => {
+  const authHeader = req.headers.authorization;
 
-  // Use Prisma to find friends for the specified userId
-  const friends = await prisma.friend.findMany({
-    where: {
-      userId: userId,
-    },
-  });
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Authorization header missing' });
+  }
 
-  res.json(friends);
+  const token = authHeader.replace('Bearer ', ''); // Remove "Bearer " prefix
+  console.log({ token, authHeader });
+  try {
+    const decodedToken = jwt.verify(token, tokenSecret || '');
+    const userId = (decodedToken as any).id;
+
+    // Use Prisma to find friends for the specified userId
+    const friends = await prisma.friend.findMany({
+      where: {
+        userId,
+      },
+    });
+
+    res.json(friends);
+  } catch (error) {
+    console.error('Error decoding JWT token:', error);
+    res.status(401).json({ error: 'JWT token malformed or expired' });
+  }
 });
 
 app.get('/messages', async (req, res) => {
