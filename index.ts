@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import { Server } from 'socket.io';
 import { createServer } from 'http';
@@ -9,11 +9,11 @@ import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 import cookieParser from 'cookie-parser';
 
-const secret = dotenv.config().parsed?.APP_SECRET;
 const tokenSecret = dotenv.config().parsed?.TOKEN_SECRET;
 const refreshTokenSecret = dotenv.config().parsed?.REFRESH_TOKEN_SECRET;
 const prisma = new PrismaClient();
 const app = express();
+
 app.use(cors({ origin: 'http://localhost:3000', credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -41,55 +41,62 @@ io.on('connection', (socket) => {
     const senderId = sender.get(socket.id);
     const receiverId = data.to;
 
-    console.log('Sender ID:', senderId);
-    console.log('Receiver ID:', receiverId);
+    try {
+      // Check if sender and receiver are friends
+      const existingFriendshipSender = await prisma.friend.findFirst({
+        where: {
+          userId: senderId,
+          friendId: receiverId,
+        },
+      });
 
-    // try {
-    //   // Check if sender and receiver are friends
-    //   const existingFriendship = await prisma.friend.findFirst({
-    //     where: {
-    //       userId: senderId,
-    //       friendId: receiverId,
-    //     },
-    //   });
+      const existingFriendshipReceiver = await prisma.friend.findFirst({
+        where: {
+          userId: receiverId,
+          friendId: senderId,
+        },
+      });
 
-    //   // If sender and receiver are not friends, handle the error or return
-    //   if (!existingFriendship) {
-    //     console.error('Sender and receiver are not friends.');
-    //     // Handle the error or return early
-    //     return;
-    //   }
+      // If sender and receiver are not friends, handle the error or return
+      if (!existingFriendshipSender || !existingFriendshipReceiver) {
+        console.error('Sender and receiver are not friends.');
+        // Handle the error or return early
+        return;
+      }
 
-    //   await prisma.message.create({
-    //     data: {
-    //       content: data.message,
-    //       published: true,
-    //       user: { connect: { id: senderId } },
-    //       friend: { connect: { id: receiverId } },
-    //     },
-    //   });
+      const friendIdFromSender = existingFriendshipReceiver?.id;
+      const friendIdFromReceiver = existingFriendshipSender?.id;
 
-    //   // Emit the new message to the receiver
-    //   io.to(users.get(data.to)).emit('new_msg', {
-    //     from: {
-    //       senderSocketId: socket.id,
-    //       senderId,
-    //       room: receiverId,
-    //     },
-    //     message: data.message,
-    //   });
-    // } catch (error) {
-    //   console.error('Error creating message:', error);
-    //   // Handle the error
-    // }
-    io.to(users.get(data.to)).emit('new_msg', {
-      from: {
-        senderSocketId: socket.id,
-        senderId,
-        room: receiverId,
-      },
-      message: data.message,
-    });
+      await prisma.message.create({
+        data: {
+          content: data.message,
+          published: true,
+          user: { connect: { id: senderId } },
+          friend: { connect: { id: friendIdFromReceiver } }, // Connect to the receiver's friendship record
+        },
+      });
+
+      // Emit the new message to the receiver
+      io.to(users.get(data.to)).emit('new_msg', {
+        from: {
+          senderSocketId: socket.id,
+          senderId,
+          room: receiverId,
+        },
+        message: data.message,
+      });
+    } catch (error) {
+      console.error('Error creating message:', error);
+      // Handle the error
+    }
+    // io.to(users.get(data.to)).emit('new_msg', {
+    //   from: {
+    //     senderSocketId: socket.id,
+    //     senderId,
+    //     room: receiverId,
+    //   },
+    //   message: data.message,
+    // });
   });
 
   socket.on('disconnect', () => {
@@ -175,7 +182,6 @@ app.post('/login', async (req, res) => {
           secure: false,
         });
 
-        console.log('/login', { accessToken, refreshToken });
         // Send response with access token and other data
         res.status(200).json({
           ok: true,
@@ -217,7 +223,7 @@ app.post('/refreshToken', async (req, res) => {
       const accessToken = jwt.sign({ id: user.id }, tokenSecret || '', {
         expiresIn: '1h',
       });
-      console.log({ accessToken });
+
       return res.status(200).json({ ok: true, accessToken });
     }
     return res.status(401).json({ ok: false, message: 'User not found' });
@@ -242,8 +248,26 @@ app.get('/user', async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: (decoded as any).id },
     });
-    if (user) {
-      return res.status(200).json({ ok: true, user });
+    const friends = await prisma.friend.findMany({
+      where: {
+        userId: (decoded as any).id,
+      },
+    });
+    console.log({
+      friendId: friends.map((friend) => friend.id),
+      userId: (decoded as any).id,
+    });
+    const messages = await prisma.message.findFirst({
+      where: {
+        userId: (decoded as any).id,
+        friendId: { in: friends.map((friend) => friend.id) },
+      },
+    });
+
+    if (user && friends) {
+      return res
+        .status(200)
+        .json({ ok: true, user: { ...user, friends, messages } });
     }
     return res.status(401).json({ ok: false, message: 'User not found' });
   } catch (error) {
@@ -299,29 +323,34 @@ app.post('/addFriend', async (req, res) => {
 });
 
 app.get('/friends', async (req, res) => {
-  const authHeader = req.headers.authorization;
-
-  if (!authHeader) {
-    return res.status(401).json({ error: 'Authorization header missing' });
+  const token = req.headers.authorization;
+  console.log({ token: token?.replace('Bearer ', '') });
+  if (!token) {
+    return res
+      .status(401)
+      .json({ error: 'Authorization header missing or malformed' });
   }
 
-  const token = authHeader.replace('Bearer ', ''); // Remove "Bearer " prefix
-  console.log({ token, authHeader });
   try {
-    const decodedToken = jwt.verify(token, tokenSecret || '');
+    const decodedToken = jwt.verify(
+      token?.replace('Bearer ', ''),
+      tokenSecret || ''
+    );
     const userId = (decodedToken as any).id;
-
     // Use Prisma to find friends for the specified userId
     const friends = await prisma.friend.findMany({
-      where: {
-        userId,
-      },
+      where: { userId },
     });
 
-    res.json(friends);
+    if (!friends || friends.length === 0) {
+      return res.status(404).json({ error: 'No friends found' });
+    }
+
+    // Return the list of friends
+    return res.status(200).json({ ok: true, friends });
   } catch (error) {
     console.error('Error decoding JWT token:', error);
-    res.status(401).json({ error: 'JWT token malformed or expired' });
+    return res.status(401).json({ error: 'JWT token malformed or expired' });
   }
 });
 
