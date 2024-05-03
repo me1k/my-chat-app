@@ -22,11 +22,14 @@ app.use(cookieParser());
 
 const server = createServer(app);
 const io = new Server(server, { cors: { origin: 'http://localhost:3000' } });
-let savedRoom: string = '';
-let targetUserId: string = '';
+
 let senderId: string = '';
+let receiverId: string = '';
+
 const users = new Map();
 const sender = new Map();
+
+let tempMessageStorage: any = [];
 
 io.on('connection', (socket) => {
   console.log('a user connected', socket.id);
@@ -38,8 +41,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('message', async (data) => {
-    const senderId = sender.get(socket.id);
-    const receiverId = data.to;
+    senderId = sender.get(socket.id);
+    receiverId = data.to;
 
     try {
       // Check if sender and receiver are friends
@@ -67,13 +70,36 @@ io.on('connection', (socket) => {
       const friendIdFromSender = existingFriendshipReceiver?.id;
       const friendIdFromReceiver = existingFriendshipSender?.id;
 
-      await prisma.message.create({
-        data: {
-          content: data.message,
-          published: true,
-          user: { connect: { id: senderId } },
-          friend: { connect: { id: friendIdFromReceiver } }, // Connect to the receiver's friendship record
-        },
+      // tempMessageStorage.push(...tempMessageStorage, [
+      //   {
+      //     content: data.message,
+      //     published: true,
+      //     userId: senderId, // Sender
+      //     friendId: friendIdFromReceiver, // Receiver's friendship id
+      //   },
+      //   {
+      //     content: data.message,
+      //     published: true,
+      //     userId: receiverId, // Receiver
+      //     friendId: friendIdFromSender, // Sender's friendship id
+      //   },
+      // ]);
+
+      await prisma.message.createMany({
+        data: [
+          {
+            content: data.message,
+            published: true,
+            userId: senderId, // Sender
+            friendId: friendIdFromReceiver, // Receiver's friendship id
+          },
+          {
+            content: data.message,
+            published: true,
+            userId: receiverId, // Receiver
+            friendId: friendIdFromSender, // Sender's friendship id
+          },
+        ],
       });
 
       // Emit the new message to the receiver
@@ -107,8 +133,6 @@ io.on('connection', (socket) => {
         break;
       }
     }
-    savedRoom = '';
-    targetUserId = '';
     senderId = '';
   });
 });
@@ -253,17 +277,14 @@ app.get('/user', async (req, res) => {
         userId: (decoded as any).id,
       },
     });
-    console.log({
-      friendId: friends.map((friend) => friend.id),
-      userId: (decoded as any).id,
-    });
-    const messages = await prisma.message.findFirst({
+
+    const messages = await prisma.message.findMany({
       where: {
         userId: (decoded as any).id,
         friendId: { in: friends.map((friend) => friend.id) },
       },
     });
-
+    console.log({ messages });
     if (user && friends) {
       return res
         .status(200)
